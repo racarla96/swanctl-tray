@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# Never commit real VPN configs or secrets
+swanctl.conf
+*.secret
+.env

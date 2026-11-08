@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""swanctl-tray: top-bar indicator to connect/disconnect a strongSwan (swanctl) tunnel.
+
+Talks to charon through `sudo -n swanctl`, so it needs passwordless sudo for swanctl
+(see examples/sudoers.d/swanctl-tray). It never reads or stores any secret.
+"""
+import configparser
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
+
+APP_ID = "swanctl-tray"
+SWANCTL = "/usr/sbin/swanctl"
+POLL_SECONDS = 5
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_ID / "config.ini"
+LOG_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / APP_ID / "last.log"
+
+ICON_UP = "network-vpn-symbolic"
+ICON_DOWN = "network-vpn-disabled-symbolic"
+ICON_BUSY = "network-vpn-acquiring-symbolic"
+ICON_ERROR = "network-vpn-no-route-symbolic"
+
+DISCONNECTED, CONNECTING, CONNECTED, ERROR = range(4)
+
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({"tunnel": {"connection": "UPVNET", "child": "net", "label": "VPN", "timeout": "120"}})
+    cfg.read(CONFIG_PATH)
+    t = cfg["tunnel"]
+    return t["connection"], t["child"], t["label"], int(t["timeout"])
+
+
+def run(args, timeout=None):
+    """Run `sudo -n swanctl ...`; return (returncode, combined output)."""
+    try:
+        p = subprocess.run(["sudo", "-n", SWANCTL, *args], capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr)
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except OSError as e:
+        return 127, str(e)
+
+
+def parse_status(output, connection):
+    """Return (established, virtual_ip) from `swanctl --list-sas` text output."""
+    established = False
+    vip = None
+    in_sa = False
+    for line in output.splitlines():
+        if line and not line[0].isspace():
+            in_sa = line.startswith(f"{connection}:")
+            established = established or (in_sa and "ESTABLISHED" in line)
+        elif in_sa:
+            m = re.match(r"\s+local\s+'.*'\s+@\s+\S+\s+\[(\d+\.\d+\.\d+\.\d+)\]", line)
+            if m:
+                vip = m.group(1)
+    return established, vip
+
+
+def notify(title, body="", urgent=False):
+    subprocess.Popen(
+        ["notify-send", "--app-name", APP_ID, "--icon", ICON_UP,
+         "--urgency", "critical" if urgent else "normal", title, body],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+class Tray:
+    def __init__(self):
+        self.connection, self.child, self.label, self.timeout = load_config()
+        self.state = DISCONNECTED
+        self.vip = None
+        self.detail = ""
+        self.busy = False
+        self.cancelled = False
+
+        self.ind =AppIndicator.Indicator.new(APP_ID, ICON_DOWN, AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+        self.menu = Gtk.Menu()
+        self.item_status = Gtk.MenuItem(label="…")
+        self.item_status.set_sensitive(False)
+        self.item_toggle = Gtk.MenuItem(label="…")
+        self.item_toggle.connect("activate", self.on_toggle)
+        item_log = Gtk.MenuItem(label="Ver último log")
+        item_log.connect("activate", self.on_log)
+        item_quit = Gtk.MenuItem(label="Salir")
+        item_quit.connect("activate", lambda *_: Gtk.main_quit())
+        for it in (self.item_status, self.item_toggle, Gtk.SeparatorMenuItem(), item_log, item_quit):
+            self.menu.append(it)
+        self.menu.show_all()
+        self.ind.set_menu(self.menu)
+
+        self.render()
+        self.refresh()
+        GLib.timeout_add_seconds(POLL_SECONDS, self.refresh)
+
+    # ---- state / UI -------------------------------------------------------
+    def render(self):
+        icon, text, action = {
+            DISCONNECTED: (ICON_DOWN, f"{self.label}: desconectada", "Conectar"),
+            CONNECTING: (ICON_BUSY, f"{self.label}: conectando… (aprueba el push)", "Cancelar"),
+            CONNECTED: (ICON_UP, f"{self.label}: conectada" + (f" ({self.vip})" if self.vip else ""), "Desconectar"),
+            ERROR: (ICON_ERROR, f"{self.label}: {self.detail}", "Reintentar"),
+        }[self.state]
+        self.ind.set_icon_full(icon, text)
+        self.item_status.set_label(text)
+        self.item_toggle.set_label(action)
+
+    def set_state(self, state, detail=""):
+        self.state, self.detail = state, detail
+        self.render()
+
+    def refresh(self):
+        if self.busy:
+            return True
+
+        def work():
+            rc, out = run(["--list-sas", "--ike", self.connection], timeout=10)
+            GLib.idle_add(self.apply_status, rc, out)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def apply_status(self, rc, out):
+        if self.busy:
+            return False
+        if rc != 0:
+            self.vip = None
+            if "password is required" in out or "a terminal is required" in out:
+                self.set_state(ERROR, "falta sudo sin contraseña para swanctl")
+            elif "Permission denied" in out or "connecting to" in out:
+                self.set_state(ERROR, "strongswan no está activo")
+            else:
+                self.set_state(DISCONNECTED)
+            return False
+        up, self.vip = parse_status(out, self.connection)
+        was = self.state
+        self.set_state(CONNECTED if up else DISCONNECTED)
+        if was == CONNECTED and not up:
+            notify(f"{self.label} desconectada")
+        return False
+
+    # ---- actions ----------------------------------------------------------
+    def on_toggle(self, *_):
+        if self.state == CONNECTED:
+            self.start(self.disconnect)
+        elif self.state == CONNECTING:
+            self.cancelled = True
+            self.start(self.disconnect)
+        else:
+            self.start(self.connect)
+
+    def start(self, fn):
+        threading.Thread(target=fn, daemon=True).start()
+
+    def connect(self):
+        self.busy = True
+        GLib.idle_add(self.set_state, CONNECTING)
+        notify(f"Conectando {self.label}", "Aprueba la notificación de Microsoft Authenticator")
+        log = []
+        run(["--terminate", "--ike", self.connection], timeout=15)  # drop any stale half-open SA
+        rc, out = run(["--load-all"], timeout=15)
+        log.append(f"$ swanctl --load-all (rc={rc})\n{out}")
+        rc, out = run(["--initiate", "--child", self.child, "--timeout", str(self.timeout)], timeout=self.timeout + 15)
+        log.append(f"$ swanctl --initiate --child {self.child} (rc={rc})\n{out}")
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LOG_PATH.write_text("\n".join(log))
+        self.busy = False
+        if self.cancelled:
+            self.cancelled = False
+            return
+        if rc == 0:
+            GLib.idle_add(self.refresh)
+            notify(f"{self.label} conectada")
+        else:
+            reason = self.guess_error(out)
+            GLib.idle_add(self.set_state, ERROR, reason)
+            notify(f"{self.label}: no se pudo conectar", reason, urgent=True)
+
+    def disconnect(self):
+        self.busy = True
+        run(["--terminate", "--ike", self.connection], timeout=20)
+        self.busy = False
+        GLib.idle_add(self.set_state, DISCONNECTED)
+        GLib.idle_add(self.refresh)
+
+    @staticmethod
+    def guess_error(out):
+        if "timeout" in out or ("retransmit" in out and "established" not in out):
+            return "sin respuesta (¿no aprobaste el push?)"
+        if "AUTHENTICATION_FAILED" in out or "EAP_FAILURE" in out:
+            return "autenticación rechazada (revisa clave/contraseña)"
+        if "password is required" in out:
+            return "falta sudo sin contraseña para swanctl"
+        return "fallo al conectar (ver último log)"
+
+    def on_log(self, *_):
+        if LOG_PATH.exists():
+            subprocess.Popen(["xdg-open", str(LOG_PATH)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            notify("Aún no hay log", "Se crea al intentar conectar")
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    if "--check-config" in sys.argv:
+        print(load_config())
+        return
+    Tray()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

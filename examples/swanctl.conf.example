@@ -1,0 +1,51 @@
+# Example /etc/swanctl/swanctl.conf for the UPV (Universitat Politècnica de València)
+# IKEv2 profile "UPVNET" (staff). Students use ALUMNO / xxxxx@alumno.upv.es.
+# Based on the UPV wiki: "Linux - VPN con Ubuntu 26.04 y Debian 13".
+#
+# Install with mode 600 (it holds secrets):
+#   sudo install -m 600 -o root -g root swanctl.conf.example /etc/swanctl/swanctl.conf
+#   sudoedit /etc/swanctl/swanctl.conf     # fill in the two placeholders
+#
+# NEVER commit your real secrets to git.
+connections {
+    UPVNET {
+        version = 2
+        remote_addrs = vpn.upv.es
+        proposals = aes256-sha256-modp2048
+        vips = 0.0.0.0
+        dpd_delay = 60s
+        encap = yes
+        fragmentation = yes
+
+        local {
+            auth = eap-mschapv2
+            id = UPVNET
+            eap_id = YOUR_USER@upvnet.upv.es
+        }
+        remote {
+            auth = psk
+            id = UPVNET
+        }
+        children {
+            net {
+                local_ts = dynamic
+                remote_ts = 158.42.0.0/16,10.10.0.0/8,172.16.0.0/12,192.168.0.0/16
+                esp_proposals = aes256-sha256-modp2048
+                dpd_action = restart
+                # "none": the tunnel only comes up when you ask (tray menu).
+                start_action = none
+            }
+        }
+    }
+}
+
+secrets {
+    ike-psk {
+        # Pre-shared key for the UPVNET row in the UPV self-service portal ("Clave para la VPN").
+        secret = __PSK_FROM_UPV_PORTAL__
+    }
+    eap-user {
+        id = YOUR_USER@upvnet.upv.es
+        secret = __YOUR_UPVNET_PASSWORD__
+    }
+}

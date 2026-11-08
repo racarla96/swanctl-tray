@@ -1,0 +1,7 @@
+# Install with:  sudo visudo -f /etc/sudoers.d/swanctl-tray
+# Replace YOUR_USER. Lets that user run swanctl as root without a password.
+#
+# WARNING: swanctl can load credentials and inspect secrets, so this grants any
+# process running as YOUR_USER root-level control of the IPsec daemon. Only do
+# this on a machine you trust.
+YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/swanctl
